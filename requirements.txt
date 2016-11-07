@@ -1,0 +1,6 @@
+boto3
+M2Crypto
+pymemcache
+Flask
+envparse
+requests
