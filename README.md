@@ -68,7 +68,7 @@ Limn configuration is passed as environment variables. Multiple values should
 take the form of space-separated strings.
 
 | var | defaults | cast | description |
-|-|-|-|-|
+|-----|----------|------|-------------|
 | `AWS_ASSUME_ROLES` | `(empty string)` | `str.split()` | List of roles limn can assume to lookup resources in different accounts. If this is not set, or limn can't find a configured role associated with the instance's `accountId` it will attempt to use [boto3 credentials](http://boto3.readthedocs.io/en/latest/guide/configuration.html). |
 | `INHERIT_TAGS` | `env:` `opt:` | `str.split()` | Whitelist of tag prefixes allowed to be inherited from parent resources. See [Tag Discovery](#tag-discovery) for details. |
 | `ROLE_TAGS` | `opt:cluster` `clusterid` `elasticbeanstalk:environment-name` | `str.split()` | Used for dynamic hostname generation. See [Hostname Discovery](#hostname-discovery) for details. |
