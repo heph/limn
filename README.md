@@ -12,8 +12,7 @@ within the same AWS account.
 
 ## Running limn
 
-Limn includes a docker-compose.yml to get started that mounts your user's AWS
-configuration directory (`~/.aws`) to quickly get started. To run limn locally:
+Limn includes a docker-compose.yml to get started. To run limn locally:
 
 ```console
 $ docker-compose up
