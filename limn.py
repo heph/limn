@@ -6,6 +6,8 @@ import boto3
 import datetime
 import time
 
+from botocore.exceptions import ClientError
+
 import hashlib
 from M2Crypto import SMIME, X509, BIO
 from M2Crypto.SMIME import PKCS7_Error
@@ -120,17 +122,22 @@ def verify_pkcs7(pkcs7):
     raise Exception("Could not verify identity document:", e)
 
 
-# Request token valid for 15 minutes, cache for 14 minutes
+# Request token valid for 60 minutes, cache for 59 minutes
 @timeit
-@cached(840)
+@cached(3540)
 def assume_role(role_arn):
   sts = boto3.client('sts')
 
-  credentials = sts.assume_role(
-    RoleArn=role_arn,
-    RoleSessionName='limn',
-    DurationSeconds=900
-  )['Credentials']
+  try:
+    credentials = sts.assume_role(
+      RoleArn=role_arn,
+      RoleSessionName='limn',
+      DurationSeconds=3600
+    )['Credentials']
+  except ClientError as e:
+    return e.response
+
+  print("Returning credentials: {}".format(credentials))
 
   return credentials
 
@@ -148,14 +155,18 @@ def human_name(instance_id):
 
 # Fetch tags and other metadata about an instance in an account
 @timeit
-@cached(30)
+@cached(60)
 def describe_instance(instance_document):
+
+  print("Searching for role matching: {} in roles: {}".format(instance_document['accountId'], AWS_ASSUME_ROLES))
   assume_role_arn = next(
     (arn for arn in AWS_ASSUME_ROLES if arn.startswith(
       "arn:aws:iam::{}:".format(instance_document['accountId']))),
     None)
-
   if assume_role_arn:
+    print("found role: {}".format(assume_role_arn))
+
+  try:
     creds = assume_role(assume_role_arn)
     ec2 = boto3.client(
       'ec2',
@@ -171,29 +182,32 @@ def describe_instance(instance_document):
       aws_session_token=creds['SessionToken'],
       region_name=instance_document['region']
     )
-  else:
+  except:
     ec2 = boto3.client('ec2', region_name=instance_document['region'])
     asg = boto3.client('autoscaling', region_name=instance_document['region'])
 
-  instance = ec2.describe_instances(
-    InstanceIds=[
-      instance_document['instanceId']
-    ]
-  )['Reservations'][0]['Instances'][0]
-
-  aws_tags = ec2.describe_tags(
-      Filters=[
-        {
-          'Name': 'resource-id',
-          'Values': [
-            instance['ImageId'],
-            instance['InstanceId'],
-            instance['SubnetId'],
-            instance['VpcId']
-          ]
-        }
+  try:
+    instance = ec2.describe_instances(
+      InstanceIds=[
+        instance_document['instanceId']
       ]
-    )['Tags']
+    )['Reservations'][0]['Instances'][0]
+
+    aws_tags = ec2.describe_tags(
+        Filters=[
+          {
+            'Name': 'resource-id',
+            'Values': [
+              instance['ImageId'],
+              instance['InstanceId'],
+              instance['SubnetId'],
+              instance['VpcId']
+            ]
+          }
+        ]
+      )['Tags']
+  except ClientError as e:
+    return e.response
 
   # If the instance is in an ASG, load the ASG tags set to 'propagate'.
   # This is to work around a race condition since launching instances from an
