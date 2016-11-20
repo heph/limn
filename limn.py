@@ -323,8 +323,6 @@ def main():
 
 
 if __name__ == "__main__":
-  port = env('PORT', cast=int, default=5000)
+  port = env('PORT', cast=int, default=8080)
   host = env('LISTEN', default='0.0.0.0')
-  if port == 5000:
-    app.debug = True
-  app.run(host=host, port=port)
+  app.run(host=host, port=port, threaded=True)
