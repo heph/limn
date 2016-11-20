@@ -20,7 +20,7 @@ def eprint(*args, **kwargs):
 @click.option(
   '-u', '--url',
   type=click.STRING,
-  default='https://limn/',
+  default='http://limn/',
   help='limn service url'
 )
 @click.option(
@@ -59,19 +59,19 @@ def main(url, prefix, pristine, upcase, sanitize, command_args):
   # POST the signed identity document to limn to identify this instance
   try:
     instance = json.loads(
-      urllib2.urlopen(url, urllib.quote(pkcs7_identity)).read()
+      urllib2.urlopen(url, urllib.urlencode({"identity": pkcs7_identity})).read()
     )
   except urllib2.HTTPError as e:
-    eprint("{}: {}".format(e, LIMN_URL))
+    eprint("{}: {}".format(e, url))
     sys.exit(1)
 
-  if 'Tags' in instance:
+  if 'tags' in instance:
     # Don't inherit existing environment variables
     env = dict()
     if not pristine:
       env = os.environ.copy()
 
-    for k, v in instance['Tags'].iteritems():
+    for k, v in instance['tags'].iteritems():
       # match tags against --prefix(es)
       if any(k.startswith(p) for p in prefix):
         _, k = k.split(':')
