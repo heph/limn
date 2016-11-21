@@ -1,43 +1,40 @@
-import os
-import sys
-import functools
-import json
+import M2Crypto
+import M2Crypto.SMIME
 import boto3
+import botocore.exceptions
 import datetime
-import time
-
-from botocore.exceptions import ClientError
-
+import envparse
+import flask
+import functools
 import hashlib
-from M2Crypto import SMIME, X509, BIO
-from M2Crypto.SMIME import PKCS7_Error
-
-from pymemcache.client.base import Client as MemcacheClient
-from envparse import env
-
-from requests.structures import CaseInsensitiveDict
-
-from flask import (
-  Flask,
-  request
-)
+import json
+import logging
+import os
+import pymemcache.client.base
+import requests.structures
+import sys
+import time
 
 
 # INHERIT_TAGS is a space-separated list of prefixes allowed to be inherited
 # by parent resources (tags on VPCs, Subnets, ASGs, and Images)
-INHERIT_TAGS = env('INHERIT_TAGS', default='env: opt:').split()
+INHERIT_TAGS = envparse.env('INHERIT_TAGS', default='env: opt:').split()
 
-ROLE_TAGS = env(
+ROLE_TAGS = envparse.env(
   'ROLE_TAGS',
   default='opt:cluster clusterid elasticbeanstalk:environment-name'
 ).split()
 
-MEMCACHE_HOST = env('MEMCACHE_HOST', default=None)
-MEMCACHE_PORT = env('MEMCACHE_PORT', cast=int, default=11211)
+MEMCACHE_HOST = envparse.env('MEMCACHE_HOST', default=None)
+MEMCACHE_PORT = envparse.env('MEMCACHE_PORT', cast=int, default=11211)
 
-AWS_ASSUME_ROLES = env('AWS_ASSUME_ROLES', default="").split()
+AWS_ASSUME_ROLES = envparse.env('AWS_ASSUME_ROLES', default="").split()
 
-app = Flask(__name__)
+LOG_LEVEL = envparse.env('LOG_LEVEL', default='error')
+
+app = flask.Flask(__name__)
+
+logging.getLogger('werkzeug').setLevel(getattr(logging, LOG_LEVEL.upper()))
 
 # Load animals and adjectives to generate human-readable unique names
 with open('assets/animals.txt') as f:
@@ -46,7 +43,7 @@ with open('assets/adjectives.txt') as f:
   ADJECTIVES = f.readlines()
 
 if MEMCACHE_HOST:
-  memcache = MemcacheClient((MEMCACHE_HOST, MEMCACHE_PORT))
+  memcache = pymemcache.client.base.Client((MEMCACHE_HOST, MEMCACHE_PORT))
 
 # http://stackoverflow.com/a/32225623
 json.JSONEncoder.default = lambda self, obj: (obj.isoformat() if isinstance(obj, datetime.datetime) else None)
@@ -73,7 +70,13 @@ def cached(timeout=600):
                                       str(args),
                                       str(kwargs))).hexdigest()
         value = memcache.get(key)
-        print('{}: Cache lookup for {}, found? {}'.format(time.time(), key, value is not None))
+        logging.debug(
+          '{}: Cache lookup for {}, found? {}'.format(
+            time.time(),
+            key,
+            value is not None
+          )
+        )
         if not value:
           value = json.dumps(function(*args, **kwargs))
           memcache.set(key, value, expire=timeout)
@@ -91,8 +94,10 @@ def timeit(method):
     result = method(*args, **kw)
     te = time.time()
 
-    print '%2.4f: %r (%r, %r)' % \
-      (te - ts, method.__name__, args, kw)
+    logging.debug(
+        '%2.4f: %r (%r, %r)' % \
+        (te - ts, method.__name__, args, kw)
+    )
     return result
 
   return timed
@@ -103,22 +108,22 @@ def timeit(method):
 @timeit
 def verify_pkcs7(pkcs7):
   pkcs7 = "-----BEGIN PKCS7-----\n{}\n-----END PKCS7-----".format(pkcs7)
-  s = SMIME.SMIME()
+  s = M2Crypto.SMIME.SMIME()
 
-  sk = X509.X509_Stack()
-  sk.push(X509.load_cert('assets/aws_public_certificate.pem'))
+  sk = M2Crypto.X509.X509_Stack()
+  sk.push(M2Crypto.X509.load_cert('assets/aws_public_certificate.pem'))
   s.set_x509_stack(sk)
 
-  st = X509.X509_Store()
+  st = M2Crypto.X509.X509_Store()
   st.load_info('assets/aws_public_certificate.pem')
   s.set_x509_store(st)
 
-  p7bio = BIO.MemoryBuffer(pkcs7)
-  p7 = SMIME.load_pkcs7_bio(p7bio)
+  p7bio = M2Crypto.BIO.MemoryBuffer(pkcs7)
+  p7 = M2Crypto.SMIME.load_pkcs7_bio(p7bio)
 
   try:
     return json.loads(s.verify(p7))
-  except SMIME.PKCS7_Error as e:
+  except M2Crypto.SMIME.PKCS7_Error as e:
     raise Exception("Could not verify identity document:", e)
 
 
@@ -134,10 +139,8 @@ def assume_role(role_arn):
       RoleSessionName='limn',
       DurationSeconds=3600
     )['Credentials']
-  except ClientError as e:
+  except botocore.exceptions.ClientError as e:
     return e.response
-
-  print("Returning credentials: {}".format(credentials))
 
   return credentials
 
@@ -158,13 +161,12 @@ def human_name(instance_id):
 @cached(60)
 def describe_instance(instance_document):
 
-  print("Searching for role matching: {} in roles: {}".format(instance_document['accountId'], AWS_ASSUME_ROLES))
   assume_role_arn = next(
     (arn for arn in AWS_ASSUME_ROLES if arn.startswith(
       "arn:aws:iam::{}:".format(instance_document['accountId']))),
     None)
   if assume_role_arn:
-    print("found role: {}".format(assume_role_arn))
+    logging.debug("found role: {}".format(assume_role_arn))
 
   try:
     creds = assume_role(assume_role_arn)
@@ -206,7 +208,7 @@ def describe_instance(instance_document):
           }
         ]
       )['Tags']
-  except ClientError as e:
+  except botocore.exceptions.ClientError as e:
     return e.response
 
   # If the instance is in an ASG, load the ASG tags set to 'propagate'.
@@ -279,7 +281,9 @@ def describe_instance(instance_document):
 # existing 'Name' tag, appending 'dhcpDomainName' if found.
 @timeit
 def generate_hostnames(instance_document):
-  instance_tags = CaseInsensitiveDict(instance_document['tags'])
+  instance_tags = requests.structures.CaseInsensitiveDict(
+      instance_document['tags']
+  )
 
   # Get the role id by searching the instance tags
   role = next(
@@ -305,14 +309,14 @@ def generate_hostnames(instance_document):
 # Lambda function entrypoint
 @app.route("/", methods=['GET', 'POST'])
 def main():
-  if request.method == 'POST':
+  if flask.request.method == 'POST':
     try:
-      instance_document = CaseInsensitiveDict(
+      instance_document = requests.structures.CaseInsensitiveDict(
         (k, v) for k, v in verify_pkcs7(
-          request.form['identity']
+          flask.request.form['identity']
         ).iteritems() if v
       )
-    except PKCS7_Error as e:
+    except M2Crypto.SMIME.PKCS7_Error as e:
       return "Error: {}".format(e), 401
 
     if instance_document:
@@ -323,6 +327,6 @@ def main():
 
 
 if __name__ == "__main__":
-  port = env('PORT', cast=int, default=8080)
-  host = env('LISTEN', default='0.0.0.0')
+  port = envparse.env('PORT', cast=int, default=8080)
+  host = envparse.env('LISTEN', default='0.0.0.0')
   app.run(host=host, port=port, threaded=True)

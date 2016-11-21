@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib
 import urllib2
 
@@ -16,10 +17,41 @@ INVALID_REGEXP = re.compile(r'[^a-zA-Z0-9_]')
 def eprint(*args, **kwargs):
   print(*args, file=sys.stderr, **kwargs)
 
+
+# env-limn is expected to run at boot, this enables retry fetches of
+# network resources that may not be immediately available
+def retry_url(url, data=None, limit=10, delay=5):
+  body = None
+
+  args = [url]
+  if data:
+    args.append(urllib.quote(data) if isinstance(data, basestring) else urllib.urlencode(data))
+  args = tuple(args)
+
+  attempt = 0
+  while attempt <= limit:
+    attempt += 1
+    try:
+      body = urllib2.urlopen(*args).read()
+    except (urllib2.URLError, urllib2.HTTPError) as e:
+      eprint("{}: {}".format(e, url))
+      if e.code == 401:
+        attempt = limit
+        eprint('Will not retry on 401 errors.')
+      if attempt < limit: # retry
+        eprint("Retrying get_url{} in {}s".format(str(args), delay))
+        time.sleep(delay)
+        continue
+      break # no error, break out of retry loop
+
+  return body
+
+
 @click.command(name='limn-env', context_settings=CONTEXT_SETTINGS)
 @click.option(
-  '-u', '--url',
+  '-u', '--limn-url',
   type=click.STRING,
+  envvar='LIMN_URL',
   default='http://limn/',
   help='limn service url'
 )
@@ -36,60 +68,53 @@ def eprint(*args, **kwargs):
   help='start with an empty environment'
 )
 @click.option(
-  '--upcase',
-  is_flag=True,
-  help='convert all environment variable keys to uppercase'
+  '-r', '--retry',
+  default=10,
+  type=click.IntRange(1, 100, clamp=True),
+  help='retry network requests N times'
 )
 @click.option(
-  '--sanitize',
-  is_flag=True,
-  help='replace invalid characters in keys to underscores'
+  '-d', '--retry-delay',
+  type=click.IntRange(1, 60, clamp=True),
+  default=5,
+  help='sleep N seconds between retries'
 )
 @click.argument('command_args', required=False, nargs=-1)
-def main(url, prefix, pristine, upcase, sanitize, command_args):
+def main(limn_url, prefix, pristine, retry, retry_delay, command_args):
+  # Inherit environment variables if configured
+  env = dict()
+  if not pristine:
+    env = os.environ.copy()
 
   # Load the instance's signed ec2 identity document
-  try:
-    identity_document_url = 'http://169.254.169.254/latest/dynamic/instance-identity/pkcs7'
-    pkcs7_identity = urllib2.urlopen(identity_document_url).read()
-  except urllib2.HTTPError as e:
-    eprint("{}: {}".format(e, identity_document_url))
-    sys.exit(1)
+  instance_identity_url = 'http://169.254.169.254/latest/dynamic/instance-identity/pkcs7'
+  pkcs7_identity = retry_url(instance_identity_url, None, retry, retry_delay)
+  if pkcs7_identity:
+    # POST the signed identity document to limn to identify this instance
+    limn_response = retry_url(limn_url, {"identity": pkcs7_identity}, retry, retry_delay)
+    if limn_response:
+      instance = json.loads(limn_response)
 
-  # POST the signed identity document to limn to identify this instance
-  try:
-    instance = json.loads(
-      urllib2.urlopen(url, urllib.urlencode({"identity": pkcs7_identity})).read()
-    )
-  except urllib2.HTTPError as e:
-    eprint("{}: {}".format(e, url))
-    sys.exit(1)
+      if 'tags' in instance:
+        for k, v in instance['tags'].iteritems():
+          # match tags against --prefix(es)
+          if any(k.startswith(p) for p in prefix):
+            _, k = k.split(':')
 
-  if 'tags' in instance:
-    # Don't inherit existing environment variables
-    env = dict()
-    if not pristine:
-      env = os.environ.copy()
+            # Uppercase environment variable keys
+            k = k.upper()
+            # Replace invalid characters with underscores
+            k = INVALID_REGEXP.sub('_', k)
 
-    for k, v in instance['tags'].iteritems():
-      # match tags against --prefix(es)
-      if any(k.startswith(p) for p in prefix):
-        _, k = k.split(':')
-
-        # Uppercase environment variable keys
-        k = k.upper() if upcase else k
-        # Replace invalid characters with underscores
-        k = INVALID_REGEXP.sub('_', k) if sanitize else k
-
-        env.update({k: v})
-
-    if command_args:
-      os.execvpe(command_args[0], command_args, env)
-    else:
-      for k, v in env.iteritems():
-        print("{}={}".format(k, json.dumps(v)))
+            env.update({k: v})
   else:
-    eprint("Warning: no tags found")
+    eprint("Could not load instance identity. Continuing without environment from limn.")
+
+  if command_args:
+    os.execvpe(command_args[0], command_args, env)
+  else:
+    for k, v in env.iteritems():
+      print("{}={}".format(k, json.dumps(v.strip('"'))))
 
 
 if __name__ == "__main__":
