@@ -35,9 +35,10 @@ def retry_url(url, data=None, limit=10, delay=5):
       body = urllib2.urlopen(*args).read()
     except (urllib2.URLError, urllib2.HTTPError) as e:
       eprint("{}: {}".format(e, url))
-      if e.code == 401:
-        attempt = limit
-        eprint('Will not retry on 401 errors.')
+      if hasattr(e, 'code'):
+        if e.code == 401:
+          attempt = limit
+          eprint('Will not retry on 401 errors.')
       if attempt < limit: # retry
         eprint("Retrying get_url{} in {}s".format(str(args), delay))
         time.sleep(delay)
