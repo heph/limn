@@ -32,7 +32,7 @@ additional resources it discovers (`tags`, `hostnames`, `dhcpDomainName`, etc).
 ```console
 $ curl -XPOST \
   --data-urlencode \
-    "$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/pkcs7)" \
+    "identity=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/pkcs7)" \
   https://limn.company.com/
 ```
 Which outputs:

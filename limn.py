@@ -293,15 +293,17 @@ def generate_hostnames(instance_document):
 
   hostnames = []
 
-  # Return the 'Name' tag, or generate a new one
-  if 'Name' in instance_tags:
-    hostnames.append(instance_tags['name'])
-
+  # Add the limn-style hostname
   hostnames.append("{}-{}-{}".format(
     role,
     instance_document['instanceId'].replace('i-', ''),
     human_name(instance_document['instanceId'])
   ).strip('.'))
+
+  # Add the value of the 'Name' tag, if it exists and is unique
+  if 'Name' in instance_tags:
+    if instance_tags['name'] not in hostnames:
+      hostnames.append(instance_tags['name'])
 
   return hostnames
 
