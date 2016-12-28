@@ -1,5 +1,7 @@
 # virtualenv
 env/
 
+**/*.pyc
+
 *.test
 *.pkcs7

@@ -17,6 +17,6 @@ services:
       MEMCACHE_HOST: memcached
       HOST: 0.0.0.0
       PORT: 5000
+      LOG_LEVEL: debug
     links:
       - 'memcached:memcached'
-

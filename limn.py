@@ -1,7 +1,6 @@
-import M2Crypto
-import M2Crypto.SMIME
+import awstrust
 import boto3
-import botocore.exceptions
+import botocore
 import datetime
 import envparse
 import flask
@@ -9,44 +8,43 @@ import functools
 import hashlib
 import json
 import logging
-import os
 import pymemcache.client.base
-import requests.structures
-import sys
 import time
 
 
+AWS_ASSUME_ROLES = envparse.env('AWS_ASSUME_ROLES', default="").split()
 # INHERIT_TAGS is a space-separated list of prefixes allowed to be inherited
 # by parent resources (tags on VPCs, Subnets, ASGs, and Images)
 INHERIT_TAGS = envparse.env('INHERIT_TAGS', default='env: opt:').split()
-
 ROLE_TAGS = envparse.env(
   'ROLE_TAGS',
   default='opt:cluster clusterid elasticbeanstalk:environment-name'
 ).split()
-
+LOG_LEVEL = envparse.env('LOG_LEVEL', default='info').upper()
 MEMCACHE_HOST = envparse.env('MEMCACHE_HOST', default=None)
 MEMCACHE_PORT = envparse.env('MEMCACHE_PORT', cast=int, default=11211)
-
-AWS_ASSUME_ROLES = envparse.env('AWS_ASSUME_ROLES', default="").split()
-
-LOG_LEVEL = envparse.env('LOG_LEVEL', default='error')
-
-app = flask.Flask(__name__)
-
-logging.getLogger('werkzeug').setLevel(getattr(logging, LOG_LEVEL.upper()))
-
-# Load animals and adjectives to generate human-readable unique names
-with open('assets/animals.txt') as f:
-  ANIMALS = f.readlines()
-with open('assets/adjectives.txt') as f:
-  ADJECTIVES = f.readlines()
-
 if MEMCACHE_HOST:
   memcache = pymemcache.client.base.Client((MEMCACHE_HOST, MEMCACHE_PORT))
 
+# Create the flask app
+app = flask.Flask(__name__)
+app.logger.setLevel(getattr(logging, LOG_LEVEL))
+
+
 # http://stackoverflow.com/a/32225623
 json.JSONEncoder.default = lambda self, obj: (obj.isoformat() if isinstance(obj, datetime.datetime) else None)
+
+
+# https://www.andreas-jung.com/contents/a-python-decorator-for-measuring-the-execution-time-of-methods
+def timeit(method):
+  def timed(*args, **kw):
+    ts = time.time()
+    result = method(*args, **kw)
+    te = time.time()
+
+    app.logger.debug('%2.4f: %r (%r, %r)' % (te - ts, method.__name__, args, kw))
+    return result
+  return timed
 
 
 # https://gist.github.com/abahgat/1395810
@@ -65,12 +63,10 @@ def cached(timeout=600):
     @functools.wraps(function)
     def wrapper(*args, **kwargs):
       if MEMCACHE_HOST:
-        key = hashlib.md5("{}{}{}".format(
-                                      function.__name__,
-                                      str(args),
-                                      str(kwargs))).hexdigest()
-        value = memcache.get(key)
-        logging.debug(
+        key = "{}{}{}".format(function.__name__, str(args), str(kwargs))
+        hashkey = hashlib.md5(key).hexdigest()
+        value = memcache.get(hashkey)
+        app.logger.debug(
           '{}: Cache lookup for {}, found? {}'.format(
             time.time(),
             key,
@@ -79,7 +75,7 @@ def cached(timeout=600):
         )
         if not value:
           value = json.dumps(function(*args, **kwargs))
-          memcache.set(key, value, expire=timeout)
+          memcache.set(hashkey, value, expire=timeout)
       else:
         value = json.dumps(function(*args, **kwargs))
       return json.loads(value)
@@ -87,67 +83,55 @@ def cached(timeout=600):
   return decorator
 
 
-# https://www.andreas-jung.com/contents/a-python-decorator-for-measuring-the-execution-time-of-methods
-def timeit(method):
-  def timed(*args, **kw):
-    ts = time.time()
-    result = method(*args, **kw)
-    te = time.time()
-
-    logging.debug(
-        '%2.4f: %r (%r, %r)' % \
-        (te - ts, method.__name__, args, kw)
-    )
-    return result
-
-  return timed
-
-
-# Verify a PKCS7 signed instance identity document. This is a simple way to
-# authenticate an EC2 instance is who it claims to be.
 @timeit
-def verify_pkcs7(pkcs7):
-  pkcs7 = "-----BEGIN PKCS7-----\n{}\n-----END PKCS7-----".format(pkcs7)
-  s = M2Crypto.SMIME.SMIME()
-
-  sk = M2Crypto.X509.X509_Stack()
-  sk.push(M2Crypto.X509.load_cert('assets/aws_public_certificate.pem'))
-  s.set_x509_stack(sk)
-
-  st = M2Crypto.X509.X509_Store()
-  st.load_info('assets/aws_public_certificate.pem')
-  s.set_x509_store(st)
-
-  p7bio = M2Crypto.BIO.MemoryBuffer(pkcs7)
-  p7 = M2Crypto.SMIME.load_pkcs7_bio(p7bio)
-
-  try:
-    return json.loads(s.verify(p7))
-  except M2Crypto.SMIME.PKCS7_Error as e:
-    raise Exception("Could not verify identity document:", e)
-
-
-# Request token valid for 60 minutes, cache for 59 minutes
-@timeit
-@cached(3540)
+@cached(3570)
 def assume_role(role_arn):
-  sts = boto3.client('sts')
+  if role_arn:
+    sts = boto3.client('sts')
+    try:
+      return sts.assume_role(
+        RoleArn=role_arn,
+        RoleSessionName='limn',
+        DurationSeconds=3600
+      )['Credentials']
+    except botocore.exceptions.ClientError as e:
+      return e.response
+  else:
+    return None
 
-  try:
-    credentials = sts.assume_role(
-      RoleArn=role_arn,
-      RoleSessionName='limn',
-      DurationSeconds=3600
-    )['Credentials']
-  except botocore.exceptions.ClientError as e:
-    return e.response
 
-  return credentials
+@timeit
+def boto3_client(service, region, creds=None):
+  if creds:
+    try:
+      return boto3.client(
+        service,
+        aws_access_key_id=creds['AccessKeyId'],
+        aws_secret_access_key=creds['SecretAccessKey'],
+        aws_session_token=creds['SessionToken'],
+        region_name=region
+      )
+    except botocore.exceptions.ClientError as e:
+      return e.response
+  else:
+    return boto3.client(service, region_name=region)
+
+
+@timeit
+def describe_instance(instanceId, ec2_client):
+  return ec2_client.describe_instances(
+    InstanceIds=[instanceId]
+  )['Reservations'][0]['Instances'][0]
 
 
 # Generate a human-readable name in the format of "adjectiveanimal"
-@timeit
 def human_name(instance_id):
+  # Load animals and adjectives to generate human-readable unique names
+  with open('assets/animals.txt') as f:
+    ANIMALS = f.readlines()
+  with open('assets/adjectives.txt') as f:
+    ADJECTIVES = f.readlines()
+
   offset = int(hashlib.md5(instance_id.encode()).hexdigest(), 16)
   name = "{}{}".format(
     ADJECTIVES[offset % len(ADJECTIVES) - 1].rstrip(),
@@ -156,179 +140,176 @@ def human_name(instance_id):
   return name
 
 
-# Fetch tags and other metadata about an instance in an account
-@timeit
-@cached(60)
-def describe_instance(instance_document):
+class Instance:
+  @timeit
+  def __init__(self, accountId, region, instanceId):
+    app.logger.debug('Looking up instance: {}, {}, {}'.format(accountId, region, instanceId))
+    self.availabilityZone = None
+    self.accountId = accountId
+    self.region = region
+    self.instanceId = instanceId
+    self.instanceType = None
+    self.imageId = None
+    self.subnetId = None
+    self.vpcId = None
+    self.hostnames = []
 
-  assume_role_arn = next(
-    (arn for arn in AWS_ASSUME_ROLES if arn.startswith(
-      "arn:aws:iam::{}:".format(instance_document['accountId']))),
-    None)
-  if assume_role_arn:
-    logging.debug("found role: {}".format(assume_role_arn))
+    # If the account exists in AWS_ASSUME_ROLES, attempt to get sts credentials
+    assume_role_arn = next((
+      arn for arn in AWS_ASSUME_ROLES if arn.startswith(
+        "arn:aws:iam::{}:".format(accountId)
+      )
+    ), None)
+    assume_role_creds = assume_role(assume_role_arn)
 
-  try:
-    creds = assume_role(assume_role_arn)
-    ec2 = boto3.client(
-      'ec2',
-      aws_access_key_id=creds['AccessKeyId'],
-      aws_secret_access_key=creds['SecretAccessKey'],
-      aws_session_token=creds['SessionToken'],
-      region_name=instance_document['region']
-    )
-    asg = boto3.client(
-      'autoscaling',
-      aws_access_key_id=creds['AccessKeyId'],
-      aws_secret_access_key=creds['SecretAccessKey'],
-      aws_session_token=creds['SessionToken'],
-      region_name=instance_document['region']
-    )
-  except:
-    ec2 = boto3.client('ec2', region_name=instance_document['region'])
-    asg = boto3.client('autoscaling', region_name=instance_document['region'])
+    asg = boto3_client('autoscaling', region, assume_role_creds)
+    ec2 = boto3_client('ec2', region, assume_role_creds)
 
-  try:
-    instance = ec2.describe_instances(
-      InstanceIds=[
-        instance_document['instanceId']
-      ]
-    )['Reservations'][0]['Instances'][0]
+    try:
+      instance = describe_instance(instanceId, ec2)
+      self.availabilityZone = instance['Placement']['AvailabilityZone']
+      self.imageId = instance['ImageId']
+      self.instanceType = instance['InstanceType']
+      self.subnetId = instance['SubnetId']
+      self.vpcId = instance['VpcId']
 
-    aws_tags = ec2.describe_tags(
-        Filters=[
-          {
-            'Name': 'resource-id',
-            'Values': [
-              instance['ImageId'],
-              instance['InstanceId'],
-              instance['SubnetId'],
-              instance['VpcId']
-            ]
-          }
-        ]
+      # Add hostnames
+      self.hostnames.append(self.instanceId)
+      if instance['PublicDnsName']:
+        self.hostnames.append(instance['PublicDnsName'])
+      if instance['PublicIpAddress']:
+        self.hostnames.append(instance['PublicIpAddress'])
+      if instance['PrivateDnsName']:
+        self.hostnames.append(instance['PrivateDnsName'])
+      if instance['PrivateIpAddress']:
+        self.hostnames.append(instance['PrivateIpAddress'])
+    except botocore.exceptions.ClientError as e:
+      app.logger.error("could not describe_instance({}): {}".format(instanceId, e.response))
+
+    self.tags = self._get_tags(asg, ec2)
+    self.dhcpDomainName = self._dhcpDomainName(ec2)
+    self.hostnames.append(self._human_hostname())
+
+    return None
+
+  @timeit
+  def _get_tags(self, asg, ec2):
+    resources = [self.imageId, self.instanceId, self.subnetId, self.vpcId]
+    try:
+      aws_tags = ec2.describe_tags(
+        Filters=[{
+          'Name': 'resource-id',
+          'Values': filter(bool, resources)
+        }]
       )['Tags']
-  except botocore.exceptions.ClientError as e:
-    return e.response
+    except botocore.exceptions.ClientError as e:
+      return e.response
 
-  # If the instance is in an ASG, load the ASG tags set to 'propagate'.
-  # This is to work around a race condition since launching instances from an
-  # ASG and tagging 'propagate-at-launch' tags don't happen at the same time.
-  try:
-    group = asg.describe_auto_scaling_instances(
-        InstanceIds=[
-          instance_document['instanceId']
-        ]
+    # If the instance is in an ASG, load the ASG tags set to 'propagate'.
+    # This is to work around a race condition since launching instances from an
+    # ASG and tagging operations don't happen at the same time.
+    try:
+      group = asg.describe_auto_scaling_instances(
+        InstanceIds=[self.instanceId]
       )['AutoScalingInstances'][0]['AutoScalingGroupName']
-    aws_tags.extend(
+      aws_tags.extend(
         asg.describe_tags(
           Filters=[
-            {
-              'Name': 'auto-scaling-group',
-              'Values': [
-                group
-              ]
-            },
-            {
-              'Name': 'propagate-at-launch',
-              'Values': [
-                'true'
-              ]
-            }
+            {'Name': 'auto-scaling-group', 'Values': [group]},
+            {'Name': 'propagate-at-launch', 'Values': ['true']}
           ]
         )['Tags']
       )
-  except:
-    pass
+    except:
+      pass
 
-  # Override the EC2 instance tags in order of parent resource relationship
-  # Exclude tags that don't start with values from INHERIT_TAGS
-  override_tags = {}
-  for resource_type in ('image', 'vpc', 'subnet', 'auto-scaling-group', 'instance'):
-    for t in aws_tags:
-      if t['ResourceType'] == resource_type:
-        if resource_type == 'instance':
-          override_tags[t['Key']] = t['Value']
-        elif any([t['Key'].lower().startswith(match.lower()) for match in INHERIT_TAGS]):
-          override_tags[t['Key']] = t['Value']
-  instance_document['tags'] = override_tags
+    # Override the EC2 instance tags in order of parent resource relationship
+    # Exclude tags that don't start with values from INHERIT_TAGS
+    tags = {}
+    for resource_type in ('image', 'vpc', 'subnet', 'auto-scaling-group', 'instance'):
+      for t in aws_tags:
+        if t['ResourceType'] == resource_type:
+          if resource_type == 'instance':
+            tags[t['Key']] = t['Value']
+          elif any([t['Key'].lower().startswith(match.lower()) for match in INHERIT_TAGS]):
+            tags[t['Key']] = t['Value']
+    return tags
 
-  # Load the DHCP Domain Name associated with the instance's VPC
-  try:
-    dhcp_options_id = ec2.describe_vpcs(
-      VpcIds=[instance['VpcId']]
-    )['Vpcs'][0]['DhcpOptionsId']
+  @timeit
+  def _dhcpDomainName(self, ec2):
+    # Load the DHCP Domain Name associated with the instance's VPC
+    try:
+      dhcp_options_id = ec2.describe_vpcs(
+        VpcIds=[self.vpcId]
+      )['Vpcs'][0]['DhcpOptionsId']
 
-    dhcp_configurations = ec2.describe_dhcp_options(
-      DhcpOptionsIds=[dhcp_options_id]
-    )['DhcpOptions'][0]['DhcpConfigurations']
+      dhcp_configurations = ec2.describe_dhcp_options(
+        DhcpOptionsIds=[dhcp_options_id]
+      )['DhcpOptions'][0]['DhcpConfigurations']
 
-    dhcp_domain_name = filter(
-      lambda c: c['Key'] == 'domain-name',
-      dhcp_configurations
-    )[0]['Values'][0]['Value']
+      return filter(
+        lambda c: c['Key'] == 'domain-name',
+        dhcp_configurations
+      )[0]['Values'][0]['Value']
+    except:
+      pass
+    return None
 
-    instance_document['dhcpDomainName'] = dhcp_domain_name
-  except:
-    pass
+  # Generate a hostname based on the ec2 instance metadata. Defaults to
+  # existing 'Name' tag, appending 'dhcpDomainName' if found.
+  @timeit
+  def _human_hostname(self):
+    tags = dict((k.lower(), v) for k, v in self.tags.iteritems())
+    # Get the role id by searching the instance tags
+    role = next(
+      (tags[k] for k in tags.keys() if k in map(str.lower, ROLE_TAGS)),
+      'noroledef'
+    )
+    # Add the human_name fqdn
+    hostname = "{}-{}-{}".format(
+      role,
+      self.instanceId.replace('i-', ''),
+      human_name(self.instanceId)
+    ).strip('.')
 
-  instance_document['hostnames'] = generate_hostnames(instance_document)
+    if self.dhcpDomainName:
+      hostname += ".{}".format(self.dhcpDomainName)
 
-  return dict(instance_document)
+    return hostname
 
-
-# Generate a hostname based on the ec2 instance metadata. Defaults to
-# existing 'Name' tag, appending 'dhcpDomainName' if found.
-@timeit
-def generate_hostnames(instance_document):
-  instance_tags = requests.structures.CaseInsensitiveDict(
-      instance_document['tags']
-  )
-
-  # Get the role id by searching the instance tags
-  role = next(
-    (instance_tags[k] for k in instance_tags.keys() if k.lower() in map(str.lower, ROLE_TAGS)),
-    'noroledef'
-  )
-
-  hostnames = []
-
-  # Add the limn-style hostname
-  hostnames.append("{}-{}-{}".format(
-    role,
-    instance_document['instanceId'].replace('i-', ''),
-    human_name(instance_document['instanceId'])
-  ).strip('.'))
-
-  # Add the value of the 'Name' tag, if it exists and is unique
-  if 'Name' in instance_tags:
-    if instance_tags['name'] not in hostnames:
-      hostnames.append(instance_tags['name'])
-
-  return hostnames
+  def __repr__(self):
+    return "Instance: {}".format(self.instanceId)
 
 
-# Lambda function entrypoint
 @app.route("/", methods=['GET', 'POST'])
 def main():
   if flask.request.method == 'POST':
     try:
-      instance_document = requests.structures.CaseInsensitiveDict(
-        (k, v) for k, v in verify_pkcs7(
-          flask.request.form['identity']
-        ).iteritems() if v
-      )
-    except M2Crypto.SMIME.PKCS7_Error as e:
+      trusted_doc = awstrust.verify_pkcs7(flask.request.form['identity'])
+    except Exception as e:
       return "Error: {}".format(e), 401
 
-    if instance_document:
-      instance = describe_instance(instance_document)
-      return json.dumps(instance)
+    if trusted_doc:
+      instance = Instance(
+        trusted_doc['accountId'],
+        trusted_doc['region'],
+        trusted_doc['instanceId'])
+      return flask.jsonify(instance.__dict__)
+    else:
+      return "unauthorized", 401
 
-  return 'bad request'
+  return 'bad request', 400
+
+
+@app.route('/<accountId>/<region>/<instanceId>', methods=['GET'])
+def lookup(accountId, region, instanceId):
+  instance = Instance(accountId, region, instanceId)
+  return flask.jsonify({'hostnames': instance.hostnames})
 
 
 if __name__ == "__main__":
   port = envparse.env('PORT', cast=int, default=8080)
   host = envparse.env('LISTEN', default='0.0.0.0')
+  if port == 5000:
+    app.debug = True
   app.run(host=host, port=port, threaded=True)

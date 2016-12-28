@@ -23,6 +23,8 @@ production service.
 
 ## Using limn
 
+### Describing Yourself
+
 The limn API is simple. `POST` your EC2 instance's pkcs7 signed
 [instance identity document](http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-identity-documents.html) against the limn server. If the signature is valid limn will attempt to call
 AssumeRole against a preconfigured role inside the target account. If that
@@ -52,14 +54,29 @@ Which outputs:
   "imageId": "ami-a9d276c9",
   "instanceType": "t2.micro",
   "pendingTime": "2016-11-04T02:58:34Z",
-  "hostnames": [
-    "redis-leader",
-    "redis-860a042a-ripetapir"
-  ],
+
   "accountId": "123456789012"
 }
 ```
 
+### Describing Public Information for Another Host
+
+If you know the host account, region, and instance id you can query limn for
+the public information about the instance. Currently this just returns the
+hostnames for the instance:
+
+```console
+$ curl -XGET https://limn.company.com/123456789012/us-west-2/i-860a042a
+```
+Which outputs:
+```json
+{
+  "hostnames": [
+    "redis-leader",
+    "redis-860a042a-ripetapir"
+  ]
+}
+```
 
 ## Configuration <a name="configuration" href="#configuration">:link:</a>
 

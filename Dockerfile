@@ -14,7 +14,11 @@ RUN buildDeps=' \
     && pip install -U pip \
     && pip install -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt \
-    && apt-get purge -y --auto-remove $buildDeps
+    && apt-get purge -y --auto-remove \
+      -o APT::AutoRemove::RecommendsImportant=false \
+      -o APT::AutoRemove::SuggestsImportant=false \
+      $buildDeps \
+    && rm -rf /var/lib/apt/lists/*
 
 USER limn
 
