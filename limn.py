@@ -152,7 +152,7 @@ class Instance:
     self.imageId = None
     self.subnetId = None
     self.vpcId = None
-    self.hostnames = []
+    hostnames = []
 
     # If the account exists in AWS_ASSUME_ROLES, attempt to get sts credentials
     assume_role_arn = next((
@@ -174,21 +174,19 @@ class Instance:
       self.vpcId = instance['VpcId']
 
       # Add hostnames
-      self.hostnames.append(self.instanceId)
-      if instance['PublicDnsName']:
-        self.hostnames.append(instance['PublicDnsName'])
-      if instance['PublicIpAddress']:
-        self.hostnames.append(instance['PublicIpAddress'])
-      if instance['PrivateDnsName']:
-        self.hostnames.append(instance['PrivateDnsName'])
-      if instance['PrivateIpAddress']:
-        self.hostnames.append(instance['PrivateIpAddress'])
+      hostnames.append(self.instanceId)
+      hostnames.append(instance.get('PublicDnsName'))
+      hostnames.append(instance.get('PublicIpAddress'))
+      hostnames.append(instance.get('PrivateDnsName'))
+      hostnames.append(instance.get('PrivateIpAddress'))
     except botocore.exceptions.ClientError as e:
       app.logger.error("could not describe_instance({}): {}".format(instanceId, e.response))
 
     self.tags = self._get_tags(asg, ec2)
     self.dhcpDomainName = self._dhcpDomainName(ec2)
-    self.hostnames.append(self._human_hostname())
+    hostnames.append(self._human_hostname())
+
+    self.hostnames = filter(bool, hostnames)
 
     return None
 
