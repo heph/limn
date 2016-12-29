@@ -297,8 +297,8 @@ def main():
       return flask.jsonify(instance.__dict__)
     else:
       return "unauthorized", 401
-
-  return 'bad request', 400
+  else:
+    return 'ok', 200
 
 
 @app.route('/<accountId>/<region>/<instanceId>', methods=['GET'])
