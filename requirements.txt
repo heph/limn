@@ -1,6 +1,4 @@
-boto3
-pymemcache
-Flask
-envparse
-requests
-awstrust
+M2Crypto==0.26.0
+awstrust==0.2.1
+pymemcache==1.4.3
+envparse==0.2.0

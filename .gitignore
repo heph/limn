@@ -5,3 +5,9 @@ env/
 
 *.test
 *.pkcs7
+
+# Serverless directories
+.serverless
+vendored/**
+
+serverless.yml

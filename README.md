@@ -1,81 +1,82 @@
 # limn
 
-Limn is an EC2 Instance "description service." It allows an EC2 instance to
-fetch its own metadata and tags without requiring IAM credentials. Limn is used
-to bootstrap instances in EC2 with private metadata.
+Limn is a reflective description service, providing a secure way to discover
+tags, hostnames, and other metadata about an EC2 Instance. It's useful for
+bootstrapping configuration and platform automation.
 
-This is more secure than granting Instance Profiles or IAM credentials with
-permission to `ec2:Describe*`, as AWS describe actions don't support
-resource-level permissions. That means an instance with permission to
-`ec2:Describe*` itself has permission to `ec2:Describe*` any other resource
-within the same AWS account.
+## Deployment
 
-## Running limn
-
-Limn includes a docker-compose.yml to get started. To run limn locally:
+Limn is a [serverless](https://serverless.com/) app for AWS Lambda. It requires
+some python packages (such as M2Crypto) which aren't available in the base
+[Lambda Execution Environment](http://docs.aws.amazon.com/lambda/latest/dg/current-supported-versions.html).
+The included `build.sh` uses Docker to compile dependencies so they are
+compatible with the Lambda environment, installing them under the `vendored/`
+directory.
 
 ```console
-$ docker-compose up
+$ ./build.sh
 ```
 
-See [Configuration](#configuration) for more information on running limn as a
-production service.
+Modify the included [serverless.yml](serverless.yml) as necessary to support
+your environment.
 
-## Using limn
+#### Cross-Account Support
+
+Limn supports cross-account resource description using `sts:AssumeRole`. To
+enable this feature you should update the `iamRoleStatements` and `environment`
+in `serverless.yml` to include the cross-account roles limn can assume:
+
+```yaml
+provider:
+  name: aws
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - "sts:AssumeRole"
+      Resource:
+        - "arn:aws:iam::123456789012:role/limn"
+        - "arn:aws:iam::345678901234:role/limn"
+        - "arn:aws:iam::567890123456:role/limn"
+  environment:
+    AWS_ASSUME_ROLES: >
+      arn:aws:iam::123456789012:role/limn
+      arn:aws:iam::345678901234:role/limn
+      arn:aws:iam::567890123456:role/limn
+```
+
+## Usage
 
 ### Describing Yourself
 
 The limn API is simple. `POST` your EC2 instance's pkcs7 signed
-[instance identity document](http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-identity-documents.html) against the limn server. If the signature is valid limn will attempt to call
-AssumeRole against a preconfigured role inside the target account. If that
-succeeds, limn finally responds with the decoded identity document and any
-additional resources it discovers (`tags`, `hostnames`, `dhcpDomainName`, etc).
+[instance identity document](http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-identity-documents.html) against the limn server. If the signature is valid limn responds with the decoded identity document and any additional
+resources it discovers (`tags`, `hostnames`, `dhcpDomainName`, etc).
 
 ```console
-$ curl -XPOST \
-  --data-urlencode \
-    "identity=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/pkcs7)" \
-  https://limn.company.com/
-```
-Which outputs:
-```json
+(~)$ PKCS7="$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/pkcs7)"
+(~)$ curl -s -XPOST --data-urlencode "$PKCS7" https://limn.server.url/|jq '.'
 {
-  "availabilityZone": "us-west-2a",
+  "availabilityZone": "us-west-2c",
   "tags": {
-    "Name": "redis-leader",
-    "opt:cluster": "redis"
+    "Name": "test-089ffe0ecf7fcc169-swankymuskrat",
+    "ClusterId": "test",
+    "env:datacenter": "example-usw2",
+    "aws:autoscaling:groupName": "test-v000",
   },
-  "instanceId": "i-860a042a",
+  "instanceId": "i-089ffe0ecf7fcc169",
   "region": "us-west-2",
-  "dhcpDomainName": "us-west-2.compute.internal",
-  "privateIp": "172.31.38.211",
-  "version": "2010-08-31",
-  "architecture": "x86_64",
-  "imageId": "ami-a9d276c9",
-  "instanceType": "t2.micro",
-  "pendingTime": "2016-11-04T02:58:34Z",
-
-  "accountId": "123456789012"
-}
-```
-
-### Describing Public Information for Another Host
-
-If you know the host account, region, and instance id you can query limn for
-the public information about the instance. Currently this just returns the
-hostnames for the instance:
-
-```console
-$ curl -XGET https://limn.company.com/123456789012/us-west-2/i-860a042a
-```
-Which outputs:
-```json
-{
+  "dhcpDomainName": "example-usw2.mydomain.com",
+  "imageId": "ami-a03facc8",
+  "vpcId": "vpc-fd43b248",
+  "subnetId": "subnet-9036b7d0",
+  "instanceType": "t2.small",
   "hostnames": [
-    "redis-leader",
-    "redis-860a042a-ripetapir"
-  ]
-}
+    "i-089ffe0ecf7fcc169",
+    "ip-10-21-32-193.us-west-2.compute.internal",
+    "10.21.32.193",
+    "test-089ffe0ecf7fcc169-swankymuskrat.example-usw2.mydomain.com"
+  ],
+  "accountId": "123456789012"
 ```
 
 ## Configuration <a name="configuration" href="#configuration">:link:</a>
@@ -88,10 +89,6 @@ take the form of space-separated strings.
 | `AWS_ASSUME_ROLES` | `(empty string)` | `str.split()` | List of roles limn can assume to lookup resources in different accounts. If this is not set, or limn can't find a configured role associated with the instance's `accountId` it will attempt to use [boto3 credentials](http://boto3.readthedocs.io/en/latest/guide/configuration.html). |
 | `INHERIT_TAGS` | `env:` `opt:` | `str.split()` | Whitelist of tag prefixes allowed to be inherited from parent resources. See [Tag Discovery](#tag-discovery) for details. |
 | `ROLE_TAGS` | `opt:cluster` `clusterid` `elasticbeanstalk:environment-name` | `str.split()` | Used for dynamic hostname generation. See [Hostname Discovery](#hostname-discovery) for details. |
-| `MEMCACHE_HOST` | `None` | `str()` | Limn supports caching results to memcached. If this is not set, limn disables memcached support. |
-| `MEMCACHE_PORT` | `11211` | `int()` | Port for memcached if enabled with `MEMCACHE_HOST`. |
-| `HOST` | `0.0.0.0` | `str()` | Flask binding host. |
-| `PORT` | `8080` | `int()` | Flask binding port. |
 
 
 ### IAM Policy
@@ -136,7 +133,7 @@ your limn server is running):
             "Action": "sts:AssumeRole",
             "Resource": [
               "arn:aws:iam::<primary-account-number>:role/limn",
-              "arn:aws:iam::<secondary-account-number>:role/limn",
+              "arn:aws:iam::<secondary-account-number>:role/limn"
             ]
         }
     ]

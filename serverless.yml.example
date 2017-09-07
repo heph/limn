@@ -1,0 +1,43 @@
+service: limn 
+
+provider:
+  name: aws
+  runtime: python2.7
+  timeout: 30
+  memorySize: 128
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - "ec2:Describe*"
+        - "autoscaling:Describe*"
+      Resource:
+        - "*"
+    - Effect: "Allow"
+      Action:
+        - "sts:AssumeRole"
+      Resource:
+        - "arn:aws:iam::123456789012:role/limn"
+        - "arn:aws:iam::345678901234:role/limn"
+        - "arn:aws:iam::567890123456:role/limn"
+  stage: dev
+  region: us-west-2
+  environment:
+    LOG_LEVEL: info
+    AWS_ASSUME_ROLES: >
+      arn:aws:iam::123456789012:role/limn
+      arn:aws:iam::345678901234:role/limn
+      arn:aws:iam::567890123456:role/limn
+
+package:
+  include:
+    - limn.py
+    - vendored/**
+    - assets/**
+
+functions:
+  limn:
+    handler: limn.main
+    events:
+      - http:
+          path: ''
+          method: post

@@ -1,39 +1,86 @@
+import os
+import sys
+
+# Only load linux-compiled dependencies if executing under linux
+if sys.platform.startswith('linux'):
+  here = os.path.dirname(os.path.realpath(__file__))
+  sys.path.append(os.path.join(here, "vendored"))
+
 import awstrust
 import boto3
 import botocore
 import datetime
-import envparse
-import flask
 import functools
 import hashlib
 import json
 import logging
 import pymemcache.client.base
 import time
+import urllib
+from envparse import env
 
 
-AWS_ASSUME_ROLES = envparse.env('AWS_ASSUME_ROLES', default="").split()
-# INHERIT_TAGS is a space-separated list of prefixes allowed to be inherited
-# by parent resources (tags on VPCs, Subnets, ASGs, and Images)
-INHERIT_TAGS = envparse.env('INHERIT_TAGS', default='env: opt:').split()
-ROLE_TAGS = envparse.env(
+# AWS_ASSUME_ROLES is a list of role ARNs this function can assume
+# to call DescribeInstances in different AWS accounts.
+AWS_ASSUME_ROLES = env(
+  'AWS_ASSUME_ROLES',
+  default=[],
+  cast=list,
+  subcast=str,
+  )
+
+# Python log level (https://docs.python.org/2/library/logging.html#levels)
+LOG_LEVEL = env(
+  'LOG_LEVEL',
+  default='debug',
+  cast=str,
+  )
+
+# INHERIT_TAGS is a comma separated list of tag prefixes inherited
+# from parent resources (tags on VPCs, Subnets, ASGs, and Images)
+INHERIT_TAGS = env(
+  'INHERIT_TAGS',
+  default=['env:', 'opt:'],
+  cast=list,
+  subcast=str
+  )
+
+# The role tag is used to generate hostnames for the instance, limn uses
+# the value of the first tag found to set the first portion of the hostname
+ROLE_TAGS = env(
   'ROLE_TAGS',
-  default='opt:cluster clusterid elasticbeanstalk:environment-name'
-).split()
-LOG_LEVEL = envparse.env('LOG_LEVEL', default='info').upper()
-MEMCACHE_HOST = envparse.env('MEMCACHE_HOST', default=None)
-MEMCACHE_PORT = envparse.env('MEMCACHE_PORT', cast=int, default=11211)
-if MEMCACHE_HOST:
-  memcache = pymemcache.client.base.Client((MEMCACHE_HOST, MEMCACHE_PORT))
+  default=['opt:cluster', 'clusterid', 'elasticbeanstalk:environment-name'],
+  cast=list,
+  subcast=str
+  )
 
-# Create the flask app
-app = flask.Flask(__name__)
-app.logger.setLevel(getattr(logging, LOG_LEVEL))
+logger = logging.getLogger()
+FORMAT = (
+  '%(asctime)s.%(msecs)3d (Z) %(aws_request_id)s '
+  '%(levelname)s:%(name)s:%(lineno)d:%(funcName)s:%(message)s\n'
+)
+datefmt = '%Y-%m-%d %H:%M:%S'
+for hand in [h for h in logger.handlers]:
+  hand.setFormatter(logging.Formatter(FORMAT, datefmt=datefmt))
+logger.setLevel(getattr(logging, LOG_LEVEL.upper()))
+# override log level for boto3/botocore. these get spammy.
+logging.getLogger('boto3').setLevel(logging.WARNING)
+logging.getLogger('botocore').setLevel(logging.WARNING)
 
+# Log our runtime config
+logger.info((
+  'Invoked with config: '
+  'AWS_ASSUME_ROLES={}, '
+  'LOG_LEVEL={}, '
+  'INHERIT_TAGS={}, '
+  'ROLE_TAGS={}').format(
+    json.dumps(AWS_ASSUME_ROLES),
+    json.dumps(LOG_LEVEL),
+    json.dumps(INHERIT_TAGS),
+    json.dumps(ROLE_TAGS)))
 
 # http://stackoverflow.com/a/32225623
 json.JSONEncoder.default = lambda self, obj: (obj.isoformat() if isinstance(obj, datetime.datetime) else None)
-
 
 # https://www.andreas-jung.com/contents/a-python-decorator-for-measuring-the-execution-time-of-methods
 def timeit(method):
@@ -42,49 +89,12 @@ def timeit(method):
     result = method(*args, **kw)
     te = time.time()
 
-    app.logger.debug('%2.4f: %r (%r, %r)' % (te - ts, method.__name__, args, kw))
+    logger.debug('%2.4f:%r(%r, %r)' % (te - ts, method.__name__, args, kw))
     return result
   return timed
 
 
-# https://gist.github.com/abahgat/1395810
-def cached(timeout=600):
-  """
-  Decorator that caches the result of a method for the specified time in seconds.
-
-  Use it as:
-
-    @cached(timeout=1200)
-    def functionToCache(arguments):
-      ...
-
-  """
-  def decorator(function):
-    @functools.wraps(function)
-    def wrapper(*args, **kwargs):
-      if MEMCACHE_HOST:
-        key = "{}{}{}".format(function.__name__, str(args), str(kwargs))
-        hashkey = hashlib.md5(key).hexdigest()
-        value = memcache.get(hashkey)
-        app.logger.debug(
-          '{}: Cache lookup for {}, found? {}'.format(
-            time.time(),
-            key,
-            value is not None
-          )
-        )
-        if not value:
-          value = json.dumps(function(*args, **kwargs))
-          memcache.set(hashkey, value, expire=timeout)
-      else:
-        value = json.dumps(function(*args, **kwargs))
-      return json.loads(value)
-    return wrapper
-  return decorator
-
-
 @timeit
-@cached(3570)
 def assume_role(role_arn):
   if role_arn:
     sts = boto3.client('sts')
@@ -139,11 +149,10 @@ def human_name(instance_id):
   )
   return name
 
-
 class Instance:
   @timeit
   def __init__(self, accountId, region, instanceId):
-    app.logger.debug('Looking up instance: {}, {}, {}'.format(accountId, region, instanceId))
+    logger.debug('Looking up instance: {}, {}, {}'.format(accountId, region, instanceId))
     self.availabilityZone = None
     self.accountId = accountId
     self.region = region
@@ -180,7 +189,7 @@ class Instance:
       hostnames.append(instance.get('PrivateDnsName'))
       hostnames.append(instance.get('PrivateIpAddress'))
     except botocore.exceptions.ClientError as e:
-      app.logger.error("could not describe_instance({}): {}".format(instanceId, e.response))
+      logger.error("could not describe_instance({}): {}".format(instanceId, e.response))
 
     self.tags = self._get_tags(asg, ec2)
     self.dhcpDomainName = self._dhcpDomainName(ec2)
@@ -222,13 +231,14 @@ class Instance:
       pass
 
     # Override the EC2 instance tags in order of parent resource relationship
-    # Exclude tags that don't start with values from INHERIT_TAGS
     tags = {}
     for resource_type in ('image', 'vpc', 'subnet', 'auto-scaling-group', 'instance'):
       for t in aws_tags:
         if t['ResourceType'] == resource_type:
+          # add all tags from the instance
           if resource_type == 'instance':
             tags[t['Key']] = t['Value']
+          # add INHERIT_TAGS from parent resources
           elif any([t['Key'].lower().startswith(match.lower()) for match in INHERIT_TAGS]):
             tags[t['Key']] = t['Value']
     return tags
@@ -279,35 +289,27 @@ class Instance:
     return "Instance: {}".format(self.instanceId)
 
 
-@app.route("/", methods=['GET', 'POST'])
-def main():
-  if flask.request.method == 'POST':
+def main(event, context):
+  response = {
+    "statusCode": 200,
+    "body": 'Usage: curl -XPOST --data-urlencode "identity=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/pkcs7)" https://limn.company.com/'
+  }
+  logger.debug("event: {}".format(json.dumps(event)))
+  if 'body' in event:
+    identity = event['body']
+    if identity.startswith('identity='):
+      identity = identity[9:]
     try:
-      trusted_doc = awstrust.verify_pkcs7(flask.request.form['identity'])
-    except Exception as e:
-      return "Error: {}".format(e), 401
-
-    if trusted_doc:
+      identity = urllib.unquote(identity).decode('utf8')
+      trusted_doc = awstrust.verify_pkcs7(identity)
       instance = Instance(
         trusted_doc['accountId'],
         trusted_doc['region'],
         trusted_doc['instanceId'])
-      return flask.jsonify(instance.__dict__)
-    else:
-      return "unauthorized", 401
-  else:
-    return 'ok', 200
-
-
-@app.route('/<accountId>/<region>/<instanceId>', methods=['GET'])
-def lookup(accountId, region, instanceId):
-  instance = Instance(accountId, region, instanceId)
-  return flask.jsonify({'hostnames': instance.hostnames})
-
-
-if __name__ == "__main__":
-  port = envparse.env('PORT', cast=int, default=8080)
-  host = envparse.env('LISTEN', default='0.0.0.0')
-  if port == 5000:
-    app.debug = True
-  app.run(host=host, port=port, threaded=True)
+      response['body'] = json.dumps(instance.__dict__)
+    except Exception as e:
+      response['statusCode'] = 401
+      response['body'] = "Error: {}".format(e)
+      raise
+  logger.info("response: {}".format(json.dumps(response)))
+  return response
