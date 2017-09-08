@@ -24,8 +24,8 @@ provider:
   environment:
     LOG_LEVEL: info
     AWS_ASSUME_ROLES: >
-      arn:aws:iam::123456789012:role/limn
-      arn:aws:iam::345678901234:role/limn
+      arn:aws:iam::123456789012:role/limn,
+      arn:aws:iam::345678901234:role/limn,
       arn:aws:iam::567890123456:role/limn
 
 package:
